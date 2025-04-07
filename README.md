@@ -1,5 +1,5 @@
 
-# autoscan.py — Automated Enumeration Toolkit
+# Scanner.py — Automated Enumeration Toolkit
 
 ## 🔍 Overview
 `autoscan.py` is a powerful Python-based automated recon tool for penetration testers and red teamers. It performs deep enumeration across multiple layers — from open ports to web fuzzing to subdomain discovery — and generates structured HTML, Markdown, and PDF reports.
