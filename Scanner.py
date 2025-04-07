@@ -140,21 +140,18 @@ def main():
                 svc_file = run_nmap_services(target, open_ports)
                 files.append(svc_file)
 
-
         if not args.subdomain_only:
             web_ports = detect_web_ports(open_ports) if open_ports else ["80"]
             for port in web_ports:
                 for tool in web_tools:
                     run_web_tool(tool)
                     files.append(f"{target}_port{port}_{tool}.txt")
-                
 
         if not args.web_only:
             def run_sub(tool): run_subdomain_tool(tool, target, args.subwordlist)
             for tool in sub_tools:
                 run_sub(tool)
                 files.append(f"{target}_subdomains_{tool}.txt")
-            
 
         if args.report:
             generate_html_report(target, files)
