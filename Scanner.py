@@ -1,164 +1,220 @@
-#!/usr/bin/env python3
-
-import subprocess
-import re
-import os
+from time import sleep
+import select
 import sys
-import argparse
+from queue import Queue, Empty
+import subprocess
+from ipaddress import ip_address
+import re
+import shlex
+from collections import namedtuple
+import os
+from threading import Thread
+from tool import tools
+from module import modules
 
 
-DEFAULT_WORDLIST = "/usr/share/wordlists/rockyou.txt"
-DEFAULT_SUB_WORDLIST = "/usr/share/wordlists/rockyou.txt"
-WEB_PORTS = {"80", "443", "8080", "8000", "8443"}
+Result = namedtuple('Result', ['target', 'cmd', 'output'])
+the_prompt = "> "   
 
-def run_command(command, output_file=None):
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    with open(output_file, "w") if output_file else open(os.devnull, "w") as f:
-        for line in process.stdout:
-            print(line, end="")
-            f.write(line)
-    process.wait()
+def prompt():
+    sys.stdout.write(the_prompt)
+    sys.stdout.flush()
 
-def run_nmap(target):
-    output_file = f"{target}_openPorts.txt"
-    print(f"[*] Running Nmap full scan on {target}...")
-    subprocess.run(["sudo", "nmap", "-p-", "-Pn", "--open", "-vvv", "-oG", output_file, target], stdout=subprocess.DEVNULL)
-    return output_file
+def banner():
+    
+    print(r"""
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~     __  ___                   ______               __ ~
+~    /  |/  /_____ _____ _   __/_  __/____   ____   / / ~
+~   / /|_/ // ___// ___/| | / / / /  / __ \ / __ \ / /  ~
+~  / /  / /(__  )(__  ) | |/ / / /  / /_/ // /_/ // /   ~
+~ /_/  /_//____//____/  |___/ /_/   \____/ \____//_/    ~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+""")
 
-def extract_open_ports(filename):
-    with open(filename) as f:
-        content = f.read()
-    ports = re.findall(r"(\d+)/open", content)
-    return ",".join(sorted(set(ports), key=int))
 
-def run_nmap_services(target, ports):
-    output_file = f"{target}_sCV_scan.txt"
-    print(f"[*] Running Nmap service scan on ports {ports}")
-    run_command(["sudo", "nmap", "-p", ports, "-sCV", "-oN", output_file, target])
-    return output_file
+class Target:
+    ip = None
+    domain_name = None
+    ports = set()
+    files = set()
+    save_prefix = ""
 
-def detect_web_ports(port_list):
-    return [port for port in port_list.split(",") if port in WEB_PORTS]
+    def __init__(self, **kwargs):
+        self.ip = kwargs.get('ip', None)
+        self.domain_name = kwargs.get('domain_name', None)
+        assert(self.ip or self.domain_name)
+        self.save_prefix = self.domain_name if self.domain_name else self.ip
+        self.save_prefix = self.save_prefix.replace(".", "-")
 
-def run_web_tool(tool, target, port, wordlist):
-    url = f"http://{target}:{port}"
-    output_file = f"{target}_port{port}_{tool}.txt"
-    print(f"[*] Running {tool} on {url}")
-    if tool == "nikto":
-        cmd = ["nikto", "-h", url]
-    elif tool == "dirb":
-        cmd = ["dirb", url, wordlist]
-    elif tool == "gobuster":
-        cmd = ["gobuster", "dir", "-u", url, "-w", wordlist]
-    elif tool == "feroxbuster":
-        cmd = ["feroxbuster", "-u", url, "-w", wordlist]
-    elif tool == "ffuf":
-        cmd = ["ffuf", "-u", f"{url}/FUZZ", "-w", wordlist]
-    else:
-        print(f"[!] Unknown tool: {tool}")
-        return
-    run_command(cmd, output_file)
+class AutoScanner:
 
-def run_subdomain_tool(tool, target, wordlist):
-    output_file = f"{target}_subdomains_{tool}.txt"
-    print(f"[*] Running {tool} for subdomain enumeration...")
-    if tool == "sublist3r":
-        cmd = ["sublist3r", "-d", target, "-o", output_file]
-    elif tool == "subfinder":
-        cmd = ["subfinder", "-d", target, "-o", output_file]
-    elif tool == "dnsx":
-        cmd = ["dnsx", "-silent", "-d", target, "-w", wordlist]
-    elif tool == "ffuf":
-        cmd = ["ffuf", "-u", f"https://FUZZ.{target}", "-w", wordlist]
-    else:
-        print(f"[!] Unknown subdomain tool: {tool}")
-        return
-    run_command(cmd, output_file)
 
-def generate_html_report(target, files, combined=False):
-    html = [f"<html><head><title>{target} Report</title><style>body{{font-family:sans-serif;}} pre{{background:#000;color:#0f0;padding:10px;}}</style></head><body>"]
-    html.append(f"<h1>Scan Report: {target}</h1><ul>")
-    for file in files:
-        section_id = file.replace(".", "_").replace(" ", "_")
-        html.append(f'<li><a href="#{section_id}">{file}</a></li>')
-    html.append("</ul><hr>")
-    for file in files:
-        section_id = file.replace(".", "_").replace(" ", "_")
-        html.append(f'<h2 id="{section_id}">{file}</h2><pre>')
+    def __init__(self):
+        self.cmd_qq = Queue()
+        self.msg_qq = Queue()
+        self.engagement_name = ""
+        self.cli_results = []
+        self.targets = [] # { ip: ip, domain_name: "", ports: set(), files: [] }
+        self.targets_file = ""
+#        self.keywords? usernames? emails? passwords?
+
+### OPTIONS
+        self.quiet = False
+        self.threading = True
+        self.is_save_to_file = True
+        self.save_prefix = ""
+### fire up the cmd queue
+        cmd_qq_thread = Thread(target=self.consume_cmd_qq, daemon=True).start()
+
+
+    def consume_cmd_qq(self):
+        while True:
+            ready_cmd = self.cmd_qq.get()
+            self.run_cli_cmd(ready_cmd)
+
+
+    def thread_cmd(self, ready_cmd):
+        if self.threading:
+            th = Thread(target=self.run_cli_cmd, args=[ready_cmd])
+            th.start()
+        else:
+            self.run_cli_cmd(ready_cmd)
+
+
+    def run_cli_cmd(self, ready_cmd):
+        tool, target, cmd = ready_cmd
+        cmd_str = ' '.join(cmd)
+        self.msg_qq.put(f"Running: {cmd_str}")
         try:
-            with open(file) as f:
-                html.append(f.read())
-        except:
-            html.append("[!] Failed to read file.")
-        html.append("</pre><hr>")
-    html.append("</body></html>")
-    out_name = "combined_report.html" if combined else f"{target}_report.html"
-    with open(out_name, "w") as f:
-        f.write("".join(html))
-    print(f"[+] HTML report written to {out_name}")
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except Exception as e:
+            self.msg_qq.put(f"Command failed: {e}")
+            return
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("target", nargs="?", help="IP or domain")
-    parser.add_argument("-f", "--file", help="File with multiple targets")
-    parser.add_argument("--parallel", action="store_true")
-    parser.add_argument("--nmap-only", action="store_true")
-    parser.add_argument("--web-only", action="store_true")
-    parser.add_argument("--subdomain-only", action="store_true")
-    parser.add_argument("--no-nmap", action="store_true")
-    parser.add_argument("--tools", help="Comma-separated web tools")
-    parser.add_argument("--subtools", help="Comma-separated subdomain tools")
-    parser.add_argument("--wordlist", default=DEFAULT_WORDLIST)
-    parser.add_argument("--subwordlist", default=DEFAULT_SUB_WORDLIST)
-    parser.add_argument("--report", action="store_true", help="Generate HTML report(s)")
-    args = parser.parse_args()
+        output = proc.stdout
+        tools[tool].process_result(target, output)
+        if self.is_save_to_file:
+            output_file = f"{self.save_prefix}{target.save_prefix}_{tool}"
+            if not self.quiet:
+                self.msg_qq.put(f"Finished: {cmd_str} -> written to: {output_file}")
+            target.files.add(output_file)
+            with open(output_file, 'a') as f:
+                f.write("\nCommand ran: " + " ".join(cmd) + "\n")
+                f.write(output)
+                
+            
 
-    targets = []
-    if args.file:
-        with open(args.file) as f:
-            targets = [line.strip() for line in f]
-    elif args.target:
-        targets = [args.target]
-    else:
-        parser.print_help()
-        sys.exit(1)
 
-    web_tools = args.tools.split(",") if args.tools else ["nikto", "dirb", "gobuster", "feroxbuster", "ffuf"]
-    sub_tools = args.subtools.split(",") if args.subtools else ["ffuf", "dnsx", "sublist3r", "subfinder"]
-    combined_files = []
-    is_only = args.nmap_only or args.web_only or args.subdomain_only
+    def list_tools(self):
+        for name, tool in tools.items():
+            print(f"{name}: {tool.description}")
+            print(f"    {tool.default_cmd}")
 
-    for target in targets:
-        files = []
-        open_ports = ""
 
-        if (is_only and args.nmap_only) or not args.no_nmap: # if run nmap
-            open_file = run_nmap(target)
-            files.append(open_file)
-            open_ports = extract_open_ports(open_file)
-            if open_ports:
-                svc_file = run_nmap_services(target, open_ports)
-                files.append(svc_file)
+    def process(self, cmd):
+        if len(cmd.strip()) == 0:
+            # this should display number of jobs / which modules/tools are still running
+            return
 
-        if not args.subdomain_only:
-            web_ports = detect_web_ports(open_ports) if open_ports else ["80"]
-            for port in web_ports:
-                for tool in web_tools:
-                    run_web_tool(tool)
-                    files.append(f"{target}_port{port}_{tool}.txt")
+        # this sort of thing gets messy / turns into an abstract syntax tree quick,
+        # so maybe we think ahead about that, but for now it's very simple.
+        cmd, *args = shlex.split(cmd)
+        if cmd == 'quit' or cmd == 'q':
+            exit(0)
+        elif cmd in modules:
+            mod = modules[cmd]
+            self.msg_qq.put(f"Adding {mod.name} module to queue...")
+            for ready_cmd in mod.run(self.targets):
+                self.cmd_qq.put(ready_cmd)
+        elif cmd in tools:
+            tool = tools[cmd]
+            if len(args) == 0 or args[0].lower() == 'help':
+                tool.list_cmds()
+            else:
+                tool_cmd = args[0]
+                if tool_cmd in tool.cmds:
+                    self.msg_qq.put(f"Adding {tool.name} - {tool_cmd} to queue...")
+                    for ready_cmd in tool.for_each(self.targets, *args):
+                        self.cmd_qq.put(ready_cmd)
+                else:
+                    print(f"Unknown command for {tool.name}: {tool_cmd}")
 
-        if not args.web_only:
-            def run_sub(tool): run_subdomain_tool(tool, target, args.subwordlist)
-            for tool in sub_tools:
-                run_sub(tool)
-                files.append(f"{target}_subdomains_{tool}.txt")
+    def startup(self):
+        name = ""
+        while len(name) < 1 or len(name) > 128 or not re.fullmatch(r"[0-9a-zA-Z_\-]+", name):
+            name = input("Engagement name: ")
 
-        if args.report:
-            generate_html_report(target, files)
-            combined_files.extend(files)
+        self.engagement_name = name
 
-    if args.report and len(targets) > 1:
-        generate_html_report("All_Targets", combined_files, combined=True)
+        save_dir = ""
+        while not os.path.exists(save_dir):
+            if len(save_dir):
+                print("Must be valid path")
+
+            save_dir = input("Output dir (leave blank for cwd): ")
+            if not save_dir.startswith('/') and not save_dir.startswith('.'):
+                save_dir = './' + save_dir
+            if save_dir[-1] != '/':
+                save_dir += '/'
+        self.save_prefix = save_dir + name + '/'
+        if os.path.exists(self.save_prefix):
+            if input("Engagement already exists. Continue? y/n: ").lower() == 'n':
+                exit(0)
+            # TODO: else use settings from existing engagment
+        else:
+            os.mkdir(self.save_prefix)
+
+        targets_file = ""
+        while not os.path.exists(targets_file):
+            targets_file = input("Path to targets file: ")
+
+        self.targets_file = targets_file
+        with open(targets_file) as f:
+            for line in f.readlines():
+                line = line.strip()
+                try:
+                    ip_address(line)
+                    self.targets.append(Target(ip=line))
+                except:
+                    self.targets.append(Target(domain_name=line.strip()))
+
+
+    def run(self):
+        prompt()
+
+        while True:
+            if not self.msg_qq.empty():
+                print()
+                while not self.msg_qq.empty():
+                    print(self.msg_qq.get())
+                    sleep(.1)
+                prompt()
+
+            ready, _, _ = select.select([sys.stdin], [], [], 1)
+            if ready:
+
+                line = sys.stdin.readline().strip()
+                self.process(line)
+                prompt()
+
+            sleep(.1)
+
+
+
+    # TODO: add_target, remove_target, add_target_port, remove_target_port, uh and a ton of other stuff
 
 if __name__ == "__main__":
-    main()
+    banner()
+    scanner = AutoScanner()
+    # TODO: argparse and use cli inputs or startup()
+
+    scanner.startup()
+    for target in scanner.targets:
+        target.ports.add(80)
+        target.ports.add(443)
+    scanner.run()
+
+
+        
+
